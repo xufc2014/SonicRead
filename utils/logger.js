@@ -45,7 +45,8 @@ export function log(msg) {
     fos.write(bytes)
     fos.close()
   } catch (e) {
-    // 忽略：日志失败不影响功能
+    // 写入失败提示（HBuilderX 控制台可见）：常见原因是 WRITE 权限未授予
+    console.warn('[SonicRead-Log] 日志写入失败：' + (e && e.message) + '，路径：' + LOG_PATH)
   }
   // #endif
 }

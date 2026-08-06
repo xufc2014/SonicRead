@@ -239,9 +239,14 @@ export default {
     }
   },
 
-  // 息屏或切后台时记录
+  // 息屏或切后台时记录：留下"被杀前最后状态"，并保存最新进度
   onHide() {
-    log('[VISIBLE] 离开前台（息屏或切后台）')
+    const t = this.inner ? Math.floor(this.inner.currentTime) : 0
+    log('[VISIBLE] 离开前台（息屏或切后台）idx=' + this.currentIndex + ' t=' + t + 's playing=' + this.isPlaying)
+    // 息屏瞬间保存一次最新进度，防止进程被杀丢进度
+    if (this.isPlaying && this.inner) {
+      this.savePlayState(t)
+    }
   },
 
   onUnload() {
@@ -393,15 +398,18 @@ export default {
             // 授权成功（result.granted 包含所需权限）：扫描
             const ok = result && result.granted && result.granted.length > 0
             this.needPermission = !ok
+            log('[PERM] 授权结果 granted=' + JSON.stringify(result && result.granted) + ' ok=' + ok)
             this.scanFiles()
           },
           (err) => {
             // 用户拒绝：显示引导 banner，让用户走"去授权"跳应用详情
             this.needPermission = true
+            log('[PERM] 用户拒绝授权')
             this.scanFiles()
           }
         )
       } catch (e) {
+        log('[PERM] 权限申请异常 ' + (e && e.message))
         this.scanFiles()
       }
     },
@@ -443,6 +451,7 @@ export default {
         if (!dir.exists()) {
           this.loading = false
           this.playlist = []
+          log('[SCAN] 目录不存在: ' + this.novelDir)
           this.showToast('目录不存在，请重新选择')
           return
         }
@@ -482,6 +491,7 @@ export default {
         // 恢复上次播放位置
         this.restorePlayback()
       } catch (e) {
+        log('[SCAN] 扫描异常 ' + (e && e.message))
         console.error('[SonicRead] 扫描目录失败', e)
         this.loading = false
       }
@@ -572,7 +582,11 @@ export default {
       this.currentIndex = -1
       this.currentTime = 0
       this.duration = 0
-      this.inner.stop()
+      try {
+        this.inner.stop()
+      } catch (e) {
+        // 忽略
+      }
       // 切换目录后重置播放记忆（从新目录开头听起）
       this.savePlayState(0)
       log('[DIR] 切换到目录 ' + this.pickerPath)
@@ -742,6 +756,7 @@ export default {
       // 自动行为或播完：如果当前集在列表末尾则停止
       if (this.currentIndex >= this.playlist.length - 1) {
         if (isAuto || this.isPlaying) {
+          log('[DONE] 已播放到列表末尾，全部播完')
           this.inner.stop()
           this.showToast('已全部播完')
         }
@@ -869,6 +884,7 @@ export default {
           this.analyzePayload = { index: idx, base64: base64 }
         })
         .catch((err) => {
+          log('[ANALYZE] 读取文件失败 idx=' + idx + ' ' + (err && err.message))
           console.error('[SonicRead] 读取文件失败', err)
         })
       // #endif
@@ -882,6 +898,10 @@ export default {
       const item = this.playlist[res.index]
       if (item) {
         item.silenceStart = res.silenceStart
+        // 分析失败（-1）或异常时记录日志；正常结果不刷屏
+        if (res.silenceStart < 0) {
+          log('[ANALYZE] 第' + (res.index + 1) + '集 无静音段或解码失败')
+        }
         console.log('[SonicRead] 第' + (res.index + 1) + '集 静音起点:', res.silenceStart, '秒')
       }
     },
