@@ -4,6 +4,7 @@
     <view class="header">
       <text class="header-title">📖 我的小说</text>
       <view class="header-actions">
+        <view class="refresh-btn" @click="openLog">📄 日志</view>
         <view class="refresh-btn" @click="openDirPicker">📁 选目录</view>
         <view class="refresh-btn" @click="onRefresh">🔄 刷新</view>
       </view>
@@ -124,6 +125,24 @@
       </view>
     </view>
 
+    <!-- ========== 日志查看面板 ========== -->
+    <view class="log-mask" v-if="logVisible" @click="logVisible = false">
+      <view class="log-panel" @click.stop>
+        <view class="log-header">
+          <text class="log-title">运行日志</text>
+          <view class="log-actions">
+            <text class="log-btn" @click="refreshLog">刷新</text>
+            <text class="log-btn log-btn-danger" @click="clearLogFile">清空</text>
+            <text class="log-btn" @click="logVisible = false">关闭</text>
+          </view>
+        </view>
+        <text class="log-path">文件：/storage/emulated/0/Download/sonicread.log</text>
+        <scroll-view class="log-body" scroll-y :show-scrollbar="false">
+          <text class="log-text">{{ logContent }}</text>
+        </scroll-view>
+      </view>
+    </view>
+
     <!-- ========== renderjs 承载节点（静音分析） ========== -->
     <!-- 通过 :analyze prop 把 { index, base64 } 传给 renderjs 层 -->
     <view ref="silenceView" :analyze="analyzePayload" class="renderjs-host"></view>
@@ -143,6 +162,10 @@ const STORAGE_KEY_INDEX = 'sonic_play_index' // 播放记忆：文件索引
 const STORAGE_KEY_TIME = 'sonic_play_time' // 播放记忆：进度（秒）
 const STORAGE_KEY_RATE = 'sonic_playback_rate' // 播放记忆：倍速
 const SWITCH_DEBOUNCE = 500 // 切歌防抖（ms）
+const AUTO_JUMP_COOLDOWN = 1500 // 自动跳转冷却（防 onEnded 与兜底重复切歌）
+
+// 运行日志（排查后台播放问题）
+import { log, readLog, clearLog } from '../../utils/logger.js'
 
 export default {
   data() {
@@ -172,7 +195,14 @@ export default {
       inner: null, // 播放器实例
       seeking: false, // 是否正在拖动进度条
       lastSwitchTime: 0, // 切歌防抖时间戳
-      lastSaveTime: 0 // 进度保存节流时间戳
+      lastSaveTime: 0, // 进度保存节流时间戳
+      autoJumpTime: 0, // 自动跳转冷却时间戳
+      heartbeatTimer: null, // 心跳定时器
+      lastBeatTime: 0, // 上次心跳时间
+      lastLogTime: 0, // 进度日志节流时间戳
+      // 日志面板状态
+      logVisible: false, // 日志面板是否显示
+      logContent: '' // 日志内容
     }
   },
 
@@ -184,17 +214,39 @@ export default {
   },
 
   onLoad() {
+    log('[BOOT] 页面加载')
     this.initPlayer()
     // 读取上次选择的小说目录
     this.novelDir = uni.getStorageSync(STORAGE_KEY_DIR) || ''
     this.checkPermissionAndScan()
+    // 心跳：每 60 秒记一条，用于判断 JS 逻辑层是否存活（息屏后停止 = 被冻结）
+    this.heartbeatTimer = setInterval(() => {
+      log('[HEARTBEAT] alive, playing=' + this.isPlaying + ', idx=' + this.currentIndex)
+    }, 60000)
   },
 
   // 从系统设置授权页返回时自动重查权限并重扫
   onShow() {
+    log('[VISIBLE] 进入前台')
     if (this.needPermission) {
       this.checkPermissionAndScan()
     }
+  },
+
+  // 息屏或切后台时记录
+  onHide() {
+    log('[VISIBLE] 离开前台（息屏或切后台）')
+  },
+
+  onUnload() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer)
+      this.heartbeatTimer = null
+    }
+    if (this.inner) {
+      this.inner.destroy()
+    }
+    log('[BOOT] 页面卸载')
   },
 
   methods: {
@@ -217,34 +269,65 @@ export default {
         if (inner.duration && !isNaN(inner.duration)) {
           this.duration = inner.duration
         }
-        // 核心：进度到达静音起点 → 自动跳下一集
         const item = this.playlist[this.currentIndex]
+        const dur = inner.duration
+
+        // 节流记录进度日志（每 15 秒一条，用于判断息屏后 JS 是否还在跑）
+        const nowTs = Date.now()
+        if (nowTs - this.lastLogTime > 15000) {
+          this.lastLogTime = nowTs
+          log('[TICK] idx=' + this.currentIndex + ' t=' + Math.floor(inner.currentTime) + 's/' + Math.floor(dur || 0) + 's')
+        }
+
+        // 自动跳转冷却：静音跳转/兜底切歌后 1.5 秒内不再自动跳（防重复切）
+        const cooldownOk = nowTs - this.autoJumpTime > AUTO_JUMP_COOLDOWN
+
+        // ① 核心：进度到达静音起点 → 自动跳下一集
         if (item && item.silenceStart > 0 && inner.currentTime >= item.silenceStart) {
-          this.next(true)
+          if (cooldownOk) {
+            log('[SILENCE] 第' + (this.currentIndex + 1) + '集 到达静音点 ' + item.silenceStart + 's，自动跳转')
+            this.autoJumpTime = nowTs
+            this.next(true)
+          }
           return
         }
+
+        // ② 兜底：接近真实结尾 1 秒内且 onEnded 未触发（防息屏 JS 冻结导致不切歌）
+        if (item && dur && dur > 10 && inner.currentTime >= dur - 1) {
+          if (cooldownOk) {
+            log('[FALLBACK] 第' + (this.currentIndex + 1) + '集 播放到结尾(' + Math.floor(inner.currentTime) + '/' + Math.floor(dur) + 's) 兜底切歌')
+            this.autoJumpTime = nowTs
+            this.next(true)
+          }
+          return
+        }
+
         // 节流保存播放进度（每 5 秒）
-        const now = Date.now()
-        if (now - this.lastSaveTime > 5000) {
-          this.lastSaveTime = now
+        if (nowTs - this.lastSaveTime > 5000) {
+          this.lastSaveTime = nowTs
           uni.setStorageSync(STORAGE_KEY_TIME, Math.floor(inner.currentTime))
         }
       })
 
       // 播放完成 → 自动切下一集（自动行为，不参与点击防抖）
       inner.onEnded(() => {
+        log('[ENDED] 第' + (this.currentIndex + 1) + '集 播放结束回调')
         this.next(true)
       })
 
       // 播放错误（如文件被删除）→ 跳过该文件
       inner.onError((err) => {
+        log('[ERROR] 播放错误 ' + JSON.stringify(err))
         console.error('[SonicRead] 播放错误', err)
         this.next(true)
       })
 
       // 播放状态回调
       inner.onPlay(() => { this.isPlaying = true })
-      inner.onPause(() => { this.isPlaying = false })
+      inner.onPause(() => {
+        this.isPlaying = false
+        log('[PAUSE] 暂停 idx=' + this.currentIndex)
+      })
       inner.onStop(() => { this.isPlaying = false })
 
       this.inner = inner
@@ -354,9 +437,11 @@ export default {
         this.loading = false
 
         if (mp3s.length === 0) {
+          log('[SCAN] 目录 ' + this.novelDir + ' 无 MP3 文件')
           this.showToast('未找到 MP3 文件')
           return
         }
+        log('[SCAN] 目录 ' + this.novelDir + ' 找到 ' + mp3s.length + ' 个 MP3')
         // 后台补全时长（顺序加载，不阻塞列表）
         this.fetchDurations(0)
         // 恢复上次播放位置
@@ -528,6 +613,7 @@ export default {
       this.inner.playbackRate = this.playbackRate
       this.inner.play()
       this.saveIndex()
+      log('[PLAY] 播放第' + (idx + 1) + '集 ' + this.playlist[idx].fullName)
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
     },
@@ -590,7 +676,28 @@ export default {
         this.inner.playbackRate = r
       }
       uni.setStorageSync(STORAGE_KEY_RATE, r)
+      log('[RATE] 倍速设为 ' + r + 'x')
       this.showToast('倍速 ' + r + 'x')
+    },
+
+    /* ================= 日志查看 ================= */
+
+    // 打开日志面板
+    openLog() {
+      this.logVisible = true
+      this.logContent = readLog(300)
+    },
+
+    // 刷新日志内容
+    refreshLog() {
+      this.logContent = readLog(300)
+    },
+
+    // 清空日志
+    clearLogFile() {
+      clearLog()
+      this.logContent = '（已清空）'
+      log('[LOG] 日志被手动清空')
     },
 
     /* ================= 进度控制 ================= */
@@ -1066,6 +1173,77 @@ export default {
 .rate-item-active {
   background-color: #3478f6;
   color: #ffffff;
+}
+
+/* ---------- 日志面板 ---------- */
+.log-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.45);
+  z-index: 1002;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.log-panel {
+  width: 640rpx;
+  max-height: 80vh;
+  background-color: #ffffff;
+  border-radius: 24rpx;
+  padding: 28rpx 28rpx 32rpx;
+  display: flex;
+  flex-direction: column;
+}
+.log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12rpx;
+}
+.log-title {
+  font-size: 32rpx;
+  font-weight: 600;
+  color: #222222;
+}
+.log-actions {
+  display: flex;
+  align-items: center;
+}
+.log-btn {
+  font-size: 24rpx;
+  color: #3478f6;
+  padding: 8rpx 20rpx;
+  border: 1rpx solid #3478f6;
+  border-radius: 28rpx;
+  margin-left: 12rpx;
+}
+.log-btn-danger {
+  color: #dd524d;
+  border-color: #dd524d;
+}
+.log-path {
+  font-size: 22rpx;
+  color: #999999;
+  margin-bottom: 12rpx;
+}
+.log-body {
+  flex: 1;
+  min-height: 400rpx;
+  max-height: 56vh;
+  background-color: #1c1c1e;
+  border-radius: 12rpx;
+  padding: 16rpx;
+}
+.log-text {
+  font-size: 22rpx;
+  font-family: monospace;
+  color: #9fe08d;
+  line-height: 1.6;
+  word-break: break-all;
+  white-space: pre-wrap;
 }
 
 /* ---------- 轻提示 ---------- */
