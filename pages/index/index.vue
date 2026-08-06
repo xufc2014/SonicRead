@@ -200,6 +200,8 @@ export default {
       heartbeatTimer: null, // 心跳定时器
       lastBeatTime: 0, // 上次心跳时间
       lastLogTime: 0, // 进度日志节流时间戳
+      wakeLock: null, // CPU 唤醒锁（息屏保 JS 存活）
+      wakeLockHeld: false, // 唤醒锁是否持有中
       // 日志面板状态
       logVisible: false, // 日志面板是否显示
       logContent: '' // 日志内容
@@ -243,6 +245,7 @@ export default {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
     }
+    this.releaseWakeLock()
     if (this.inner) {
       this.inner.destroy()
     }
@@ -322,13 +325,20 @@ export default {
         this.next(true)
       })
 
-      // 播放状态回调
-      inner.onPlay(() => { this.isPlaying = true })
+      // 播放状态回调：播放中持有唤醒锁，暂停/停止释放
+      inner.onPlay(() => {
+        this.isPlaying = true
+        this.acquireWakeLock()
+      })
       inner.onPause(() => {
         this.isPlaying = false
+        this.releaseWakeLock()
         log('[PAUSE] 暂停 idx=' + this.currentIndex)
       })
-      inner.onStop(() => { this.isPlaying = false })
+      inner.onStop(() => {
+        this.isPlaying = false
+        this.releaseWakeLock()
+      })
 
       this.inner = inner
     },
@@ -664,6 +674,44 @@ export default {
       if (now - this.lastSwitchTime < SWITCH_DEBOUNCE) return false
       this.lastSwitchTime = now
       return true
+    },
+
+    /* ================= CPU 唤醒锁（息屏保活） ================= */
+    /**
+     * 获取 PARTIAL_WAKE_LOCK：息屏后 CPU 保持唤醒，JS 逻辑层不冻结，
+     * onTimeUpdate / 心跳 / 兜底切歌才能持续运行。
+     * 需要 manifest 中的 WAKE_LOCK 权限（已声明）。
+     */
+    acquireWakeLock() {
+      if (this.wakeLockHeld) return
+      // #ifdef APP-PLUS
+      try {
+        const PowerManager = plus.android.importClass('android.os.PowerManager')
+        const main = plus.android.runtimeMainActivity()
+        const pm = main.getSystemService('power') // Context.POWER_SERVICE
+        this.wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, 'SonicRead::Playback')
+        this.wakeLock.acquire()
+        this.wakeLockHeld = true
+        log('[WAKELOCK] 已获取（息屏保持 CPU 唤醒）')
+      } catch (e) {
+        log('[WAKELOCK] 获取失败 ' + (e && e.message))
+      }
+      // #endif
+    },
+
+    // 释放唤醒锁（暂停/停止时调用，省电）
+    releaseWakeLock() {
+      if (!this.wakeLockHeld || !this.wakeLock) return
+      // #ifdef APP-PLUS
+      try {
+        this.wakeLock.release()
+      } catch (e) {
+        // 忽略
+      }
+      // #endif
+      this.wakeLock = null
+      this.wakeLockHeld = false
+      log('[WAKELOCK] 已释放')
     },
 
     /* ================= 倍速播放 ================= */
