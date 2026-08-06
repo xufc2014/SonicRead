@@ -204,6 +204,8 @@ export default {
       wakeLock: null, // CPU 唤醒锁（息屏保 JS 存活）
       wakeLockHeld: false, // 唤醒锁是否持有中
       restoreSeekApplied: false, // 恢复播放时 seek 是否已执行（防重复）
+      healthTimer: null, // 播放器健康检查定时器
+      healthRetries: 0, // 卡死重试次数（0=未重试 1=已重试一次）
       // 日志面板状态
       logVisible: false, // 日志面板是否显示
       logContent: '' // 日志内容
@@ -246,6 +248,10 @@ export default {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer)
       this.heartbeatTimer = null
+    }
+    if (this.healthTimer) {
+      clearTimeout(this.healthTimer)
+      this.healthTimer = null
     }
     this.releaseWakeLock()
     if (this.inner) {
@@ -640,6 +646,12 @@ export default {
       if (idx < 0 || idx >= this.playlist.length) return
       this.currentIndex = idx
       this.currentTime = 0
+      // 切歌前先停止旧播放，重置播放器内部状态（防连续切歌时状态残留导致卡 0s/0s）
+      try {
+        this.inner.stop()
+      } catch (e) {
+        // 忽略
+      }
       this.inner.src = 'file://' + this.playlist[idx].path
       // 切歌后保持用户设置的倍速（个别机型需每次设置才生效）
       this.inner.playbackRate = this.playbackRate
@@ -649,6 +661,54 @@ export default {
       log('[PLAY] 播放第' + (idx + 1) + '集 ' + this.playlist[idx].fullName)
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
+      // 启动播放器健康检查（防卡死）
+      this.watchPlaybackHealth()
+    },
+
+    /**
+     * 播放器健康检查：切歌 3 秒后若仍停在 0s/0s（播放器声称在播但没真正加载），
+     * 说明播放器卡死（日志实证：自动切歌后偶发）。处理：
+     * 第一次 → stop + 重新加载重播；仍卡 → 跳过该文件播下一集。
+     */
+    watchPlaybackHealth() {
+      if (this.healthTimer) {
+        clearTimeout(this.healthTimer)
+        this.healthTimer = null
+      }
+      this.healthRetries = 0
+      const check = () => {
+        this.healthTimer = null
+        const inner = this.inner
+        if (!inner) return
+        const t = inner.currentTime
+        const d = inner.duration
+        // 声称播放中 + 3 秒后时长/进度仍为 0 → 卡死
+        const stalled = this.isPlaying && (!d || d <= 0) && (!t || t <= 0)
+        if (!stalled) return
+        if (this.healthRetries === 0) {
+          // 第一次：重置重播
+          this.healthRetries = 1
+          log('[HEALTH] 播放器疑似卡死(0s/0s)，重置重播')
+          try {
+            inner.stop()
+          } catch (e) {
+            // 忽略
+          }
+          const item = this.playlist[this.currentIndex]
+          if (item) {
+            inner.src = 'file://' + item.path
+            inner.playbackRate = this.playbackRate
+            inner.play()
+            log('[HEALTH] 已重置重播 ' + item.fullName)
+          }
+          this.healthTimer = setTimeout(check, 3000)
+        } else {
+          // 第二次仍卡：跳过该文件
+          log('[HEALTH] 重播仍卡死，跳过当前集')
+          this.next(true)
+        }
+      }
+      this.healthTimer = setTimeout(check, 3000)
     },
 
     togglePlay() {
@@ -866,7 +926,6 @@ export default {
       this.inner.playbackRate = this.playbackRate
       this.inner.play()
       log('[RESTORE] 恢复播放 idx=' + idx + ' 目标进度=' + savedTime + 's ' + item.fullName)
-
       // seek 修复：直接 seek 可能在播放器未就绪时失效（导致从头播），
       // 改为播放器就绪（onCanplay）后 seek，1.5 秒超时兜底
       this.restoreSeekApplied = false
@@ -886,6 +945,8 @@ export default {
 
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
+      // 启动播放器健康检查（防恢复时卡死）
+      this.watchPlaybackHealth()
     },
 
     /* ================= 其他 ================= */
