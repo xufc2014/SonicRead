@@ -158,8 +158,9 @@
  * - 播放进度到达 silenceStart 自动切下一集
  */
 const STORAGE_KEY_DIR = 'sonic_novel_dir' // 播放记忆：小说目录
-const STORAGE_KEY_INDEX = 'sonic_play_index' // 播放记忆：文件索引
-const STORAGE_KEY_TIME = 'sonic_play_time' // 播放记忆：进度（秒）
+const STORAGE_KEY_STATE = 'sonic_play_state' // 播放记忆：{index, time}（集数+秒数绑定存储）
+const STORAGE_KEY_INDEX = 'sonic_play_index' // 旧版存储兼容：文件索引
+const STORAGE_KEY_TIME = 'sonic_play_time' // 旧版存储兼容：进度（秒）
 const STORAGE_KEY_RATE = 'sonic_playback_rate' // 播放记忆：倍速
 const SWITCH_DEBOUNCE = 500 // 切歌防抖（ms）
 const AUTO_JUMP_COOLDOWN = 1500 // 自动跳转冷却（防 onEnded 与兜底重复切歌）
@@ -202,6 +203,7 @@ export default {
       lastLogTime: 0, // 进度日志节流时间戳
       wakeLock: null, // CPU 唤醒锁（息屏保 JS 存活）
       wakeLockHeld: false, // 唤醒锁是否持有中
+      restoreSeekApplied: false, // 恢复播放时 seek 是否已执行（防重复）
       // 日志面板状态
       logVisible: false, // 日志面板是否显示
       logContent: '' // 日志内容
@@ -275,9 +277,9 @@ export default {
         const item = this.playlist[this.currentIndex]
         const dur = inner.duration
 
-        // 节流记录进度日志（每 15 秒一条，用于判断息屏后 JS 是否还在跑）
+        // 节流记录进度日志（每 5 秒一条，精确定位"停止工作"的时间点）
         const nowTs = Date.now()
-        if (nowTs - this.lastLogTime > 15000) {
+        if (nowTs - this.lastLogTime > 5000) {
           this.lastLogTime = nowTs
           log('[TICK] idx=' + this.currentIndex + ' t=' + Math.floor(inner.currentTime) + 's/' + Math.floor(dur || 0) + 's')
         }
@@ -305,10 +307,10 @@ export default {
           return
         }
 
-        // 节流保存播放进度（每 5 秒）
+        // 节流保存播放状态（每 5 秒：集数+进度绑定存储）
         if (nowTs - this.lastSaveTime > 5000) {
           this.lastSaveTime = nowTs
-          uni.setStorageSync(STORAGE_KEY_TIME, Math.floor(inner.currentTime))
+          this.savePlayState(Math.floor(inner.currentTime))
         }
       })
 
@@ -320,15 +322,31 @@ export default {
 
       // 播放错误（如文件被删除）→ 跳过该文件
       inner.onError((err) => {
-        log('[ERROR] 播放错误 ' + JSON.stringify(err))
+        log('[ERROR] code=' + (err && err.errCode) + ' msg=' + (err && err.errMsg))
         console.error('[SonicRead] 播放错误', err)
         this.next(true)
+      })
+
+      // 缓冲等待（卡顿/无声音时看是否卡在这）
+      inner.onWaiting(() => {
+        log('[WAITING] 缓冲中 idx=' + this.currentIndex)
+      })
+
+      // 可以播放
+      inner.onCanplay(() => {
+        log('[CANPLAY] 就绪 idx=' + this.currentIndex)
+      })
+
+      // 跳转完成
+      inner.onSeeked(() => {
+        log('[SEEKED] 跳转完成 idx=' + this.currentIndex)
       })
 
       // 播放状态回调：播放中持有唤醒锁，暂停/停止释放
       inner.onPlay(() => {
         this.isPlaying = true
         this.acquireWakeLock()
+        log('[PLAYING] 开始播放 idx=' + this.currentIndex)
       })
       inner.onPause(() => {
         this.isPlaying = false
@@ -338,6 +356,7 @@ export default {
       inner.onStop(() => {
         this.isPlaying = false
         this.releaseWakeLock()
+        log('[STOP] 停止 idx=' + this.currentIndex)
       })
 
       this.inner = inner
@@ -548,6 +567,9 @@ export default {
       this.currentTime = 0
       this.duration = 0
       this.inner.stop()
+      // 切换目录后重置播放记忆（从新目录开头听起）
+      this.savePlayState(0)
+      log('[DIR] 切换到目录 ' + this.pickerPath)
       this.scanFiles()
     },
 
@@ -622,7 +644,8 @@ export default {
       // 切歌后保持用户设置的倍速（个别机型需每次设置才生效）
       this.inner.playbackRate = this.playbackRate
       this.inner.play()
-      this.saveIndex()
+      // 立即保存播放状态（进度归零，防进程被杀后恢复错档）
+      this.savePlayState(0)
       log('[PLAY] 播放第' + (idx + 1) + '集 ' + this.playlist[idx].fullName)
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
@@ -634,8 +657,10 @@ export default {
         return
       }
       if (this.isPlaying) {
+        log('[CTRL] 用户点击暂停')
         this.inner.pause()
       } else {
+        log('[CTRL] 用户点击继续播放')
         this.inner.play()
       }
     },
@@ -758,6 +783,7 @@ export default {
     onSeek(e) {
       const t = e.detail.value
       this.currentTime = t
+      log('[SEEK] 用户拖动进度到 ' + t + 's')
       this.inner.seek(t)
       this.seeking = false
       // 用户主动拖入静音段 → 立即切歌（视为主动跳过静音）
@@ -802,25 +828,63 @@ export default {
 
     /* ================= 播放记忆 ================= */
 
-    saveIndex() {
-      uni.setStorageSync(STORAGE_KEY_INDEX, this.currentIndex)
+    // 保存播放状态（集数 + 进度秒数绑定存储，防止进度串档）
+    savePlayState(time) {
+      const state = {
+        index: this.currentIndex,
+        time: Math.max(0, Math.floor(time || 0))
+      }
+      uni.setStorageSync(STORAGE_KEY_STATE, state)
+      // 兼容旧版读取（老版本只读这两个键）
+      uni.setStorageSync(STORAGE_KEY_INDEX, state.index)
+      uni.setStorageSync(STORAGE_KEY_TIME, state.time)
     },
 
     restorePlayback() {
       if (this.playlist.length === 0) return
-      const savedIndex = uni.getStorageSync(STORAGE_KEY_INDEX)
-      const savedTime = uni.getStorageSync(STORAGE_KEY_TIME) || 0
+      // 读取播放状态：优先新格式 {index, time}，兼容旧格式
+      let savedIndex = 0
+      let savedTime = 0
+      const state = uni.getStorageSync(STORAGE_KEY_STATE)
+      if (state && typeof state === 'object' && typeof state.index === 'number') {
+        savedIndex = state.index
+        savedTime = state.time || 0
+      } else {
+        const idx = uni.getStorageSync(STORAGE_KEY_INDEX)
+        if (typeof idx === 'number' && idx >= 0) savedIndex = idx
+        savedTime = uni.getStorageSync(STORAGE_KEY_TIME) || 0
+      }
       const idx =
-        typeof savedIndex === 'number' && savedIndex >= 0 && savedIndex < this.playlist.length
-          ? savedIndex
-          : 0
+        savedIndex >= 0 && savedIndex < this.playlist.length ? savedIndex : 0
+      const item = this.playlist[idx]
+      if (!item) return
+
       // 自动续播上次进度
       this.currentIndex = idx
-      this.inner.src = 'file://' + this.playlist[idx].path
+      this.currentTime = 0
+      this.inner.src = 'file://' + item.path
+      this.inner.playbackRate = this.playbackRate
       this.inner.play()
-      if (savedTime > 0) {
-        this.inner.seek(savedTime)
+      log('[RESTORE] 恢复播放 idx=' + idx + ' 目标进度=' + savedTime + 's ' + item.fullName)
+
+      // seek 修复：直接 seek 可能在播放器未就绪时失效（导致从头播），
+      // 改为播放器就绪（onCanplay）后 seek，1.5 秒超时兜底
+      this.restoreSeekApplied = false
+      const applySeek = () => {
+        if (this.restoreSeekApplied) return
+        this.restoreSeekApplied = true
+        const dur = this.inner.duration
+        if (savedTime > 1 && dur && !isNaN(dur) && savedTime < dur - 1) {
+          this.inner.seek(savedTime)
+          log('[RESTORE] seek -> ' + savedTime + 's（时长 ' + Math.floor(dur) + 's）')
+        } else {
+          log('[RESTORE] 跳过 seek（time=' + savedTime + 's, dur=' + Math.floor(dur || 0) + 's）')
+        }
       }
+      this.inner.onCanplay(applySeek)
+      setTimeout(applySeek, 1500)
+
+      // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
     },
 

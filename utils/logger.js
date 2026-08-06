@@ -12,13 +12,14 @@
 const LOG_PATH = '/storage/emulated/0/Download/sonicread.log'
 const MAX_SIZE = 512 * 1024 // 日志超过 512KB 自动清空重写
 
-// 当前时间，格式 YYYY-MM-DD HH:mm:ss
+// 当前时间，格式 YYYY-MM-DD HH:mm:ss.mmm（含毫秒，便于判断时序）
 function now() {
   const d = new Date()
   const p = (n) => (n < 10 ? '0' + n : n)
   return (
     d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
-    ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+    ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) +
+    '.' + String(d.getMilliseconds()).padStart(3, '0')
   )
 }
 
