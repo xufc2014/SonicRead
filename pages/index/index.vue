@@ -70,6 +70,25 @@
         <view class="ctrl-btn ctrl-main" @click="togglePlay">{{ isPlaying ? '⏸' : '▶' }}</view>
         <view class="ctrl-btn" @click="next">⏭</view>
       </view>
+      <view class="rate-row">
+        <view class="rate-btn" @click="ratePickerVisible = true">{{ rateLabel }}</view>
+      </view>
+    </view>
+
+    <!-- ========== 倍速选择面板 ========== -->
+    <view class="rate-mask" v-if="ratePickerVisible" @click="ratePickerVisible = false">
+      <view class="rate-panel" @click.stop>
+        <text class="rate-title">播放速度</text>
+        <view class="rate-grid">
+          <view
+            v-for="r in rateOptions"
+            :key="r"
+            class="rate-item"
+            :class="{ 'rate-item-active': playbackRate === r }"
+            @click="setRate(r)"
+          >{{ r }}x</view>
+        </view>
+      </view>
     </view>
 
     <!-- ========== 轻提示（静音跳转等） ========== -->
@@ -122,6 +141,7 @@
 const STORAGE_KEY_DIR = 'sonic_novel_dir' // 播放记忆：小说目录
 const STORAGE_KEY_INDEX = 'sonic_play_index' // 播放记忆：文件索引
 const STORAGE_KEY_TIME = 'sonic_play_time' // 播放记忆：进度（秒）
+const STORAGE_KEY_RATE = 'sonic_playback_rate' // 播放记忆：倍速
 const SWITCH_DEBOUNCE = 500 // 切歌防抖（ms）
 
 export default {
@@ -137,6 +157,10 @@ export default {
       needPermission: false, // 是否缺少存储权限
       toast: '', // 轻提示
       analyzePayload: null, // 传给 renderjs 的分析任务
+      // 倍速播放
+      playbackRate: 1, // 当前倍速（持久化保存）
+      ratePickerVisible: false, // 倍速选择面板是否显示
+      rateOptions: [0.5, 0.75, 1, 1.25, 1.5, 2], // 可选倍速档位
       // 目录选择面板状态
       dirPickerVisible: false, // 面板是否显示
       pickerPath: '', // 浏览中的路径
@@ -149,6 +173,13 @@ export default {
       seeking: false, // 是否正在拖动进度条
       lastSwitchTime: 0, // 切歌防抖时间戳
       lastSaveTime: 0 // 进度保存节流时间戳
+    }
+  },
+
+  computed: {
+    // 倍速按钮显示文案，如 "1.0x"
+    rateLabel() {
+      return this.playbackRate + 'x'
     }
   },
 
@@ -170,8 +201,14 @@ export default {
     /* ================= 初始化 ================= */
 
     initPlayer() {
+      // 读取持久化的倍速设置（用户上次设置的播放速度）
+      const savedRate = parseFloat(uni.getStorageSync(STORAGE_KEY_RATE))
+      this.playbackRate = !isNaN(savedRate) && savedRate > 0 ? savedRate : 1
+
       const inner = uni.createInnerAudioContext()
       // 注意：obeyMuteSwitch 在 App-Android 端为只读属性，赋值会抛 "only a getter" 错误，故不设置（该属性仅 iOS 有意义）
+      // 恢复倍速设置
+      inner.playbackRate = this.playbackRate
 
       // 播放进度监听（500ms 级，拖动中跳过避免抖动）
       inner.onTimeUpdate(() => {
@@ -487,6 +524,8 @@ export default {
       this.currentIndex = idx
       this.currentTime = 0
       this.inner.src = 'file://' + this.playlist[idx].path
+      // 切歌后保持用户设置的倍速（个别机型需每次设置才生效）
+      this.inner.playbackRate = this.playbackRate
       this.inner.play()
       this.saveIndex()
       // 预分析静音位置（不阻塞播放）
@@ -539,6 +578,19 @@ export default {
       if (now - this.lastSwitchTime < SWITCH_DEBOUNCE) return false
       this.lastSwitchTime = now
       return true
+    },
+
+    /* ================= 倍速播放 ================= */
+
+    // 设置播放倍速并持久化保存
+    setRate(r) {
+      this.playbackRate = r
+      this.ratePickerVisible = false
+      if (this.inner) {
+        this.inner.playbackRate = r
+      }
+      uni.setStorageSync(STORAGE_KEY_RATE, r)
+      this.showToast('倍速 ' + r + 'x')
     },
 
     /* ================= 进度控制 ================= */
@@ -955,6 +1007,65 @@ export default {
 .ctrl-main {
   font-size: 72rpx;
   padding: 4rpx 40rpx;
+}
+
+/* ---------- 倍速 ---------- */
+.rate-row {
+  display: flex;
+  justify-content: center;
+  margin-top: 4rpx;
+}
+.rate-btn {
+  font-size: 26rpx;
+  color: #3478f6;
+  background-color: #eef4ff;
+  padding: 8rpx 32rpx;
+  border-radius: 28rpx;
+}
+.rate-mask {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: rgba(0, 0, 0, 0.35);
+  z-index: 1001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.rate-panel {
+  width: 500rpx;
+  background-color: #ffffff;
+  border-radius: 24rpx;
+  padding: 32rpx 32rpx 40rpx;
+}
+.rate-title {
+  display: block;
+  text-align: center;
+  font-size: 30rpx;
+  font-weight: 600;
+  color: #222222;
+  margin-bottom: 24rpx;
+}
+.rate-grid {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+}
+.rate-item {
+  width: 140rpx;
+  text-align: center;
+  font-size: 30rpx;
+  color: #333333;
+  background-color: #f5f6f8;
+  padding: 20rpx 0;
+  border-radius: 16rpx;
+  margin-bottom: 16rpx;
+}
+.rate-item-active {
+  background-color: #3478f6;
+  color: #ffffff;
 }
 
 /* ---------- 轻提示 ---------- */
