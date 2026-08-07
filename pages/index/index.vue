@@ -206,6 +206,9 @@ export default {
       restoreSeekApplied: false, // 恢复播放时 seek 是否已执行（防重复）
       healthTimer: null, // 播放器健康检查定时器
       healthRetries: 0, // 卡死重试次数（0=未重试 1=已重试一次）
+      monitorTimer: null, // 持续进度监测定时器（播放中途卡死检测）
+      lastSampleTime: -1, // 上次采样进度（秒）
+      stallCount: 0, // 连续未前进次数
       // 日志面板状态
       logVisible: false, // 日志面板是否显示
       logContent: '' // 日志内容
@@ -257,6 +260,10 @@ export default {
     if (this.healthTimer) {
       clearTimeout(this.healthTimer)
       this.healthTimer = null
+    }
+    if (this.monitorTimer) {
+      clearInterval(this.monitorTimer)
+      this.monitorTimer = null
     }
     this.releaseWakeLock()
     if (this.inner) {
@@ -724,8 +731,10 @@ export default {
       log('[PLAY] 播放第' + (idx + 1) + '集 ' + this.playlist[idx].fullName)
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
-      // 启动播放器健康检查（防卡死）
+      // 启动播放器健康检查（防切歌卡死）
       this.watchPlaybackHealth()
+      // 启动持续进度监测（防播放中途卡死）
+      this.startMonitor()
     },
 
     /**
@@ -861,6 +870,70 @@ export default {
       this.wakeLock = null
       this.wakeLockHeld = false
       log('[WAKELOCK] 已释放')
+    },
+
+    /**
+     * 持续进度监测（防"播放到一半卡死"）：
+     * 每 15 秒采样一次 currentTime，若连续 2 次（30 秒）没有前进且声称播放中，
+     * 判定播放器卡死 → stop + 重新加载 + seek 回卡住位置继续播。
+     * 原理：播放中进度必然持续前进；30 秒不动只可能是卡死/冻结。
+     */
+    startMonitor() {
+      if (this.monitorTimer) {
+        clearInterval(this.monitorTimer)
+        this.monitorTimer = null
+      }
+      this.lastSampleTime = -1
+      this.stallCount = 0
+      this.monitorTimer = setInterval(() => {
+        if (!this.isPlaying) {
+          // 暂停/停止时不检测，重置计数
+          this.stallCount = 0
+          return
+        }
+        const t = Math.floor(this.inner.currentTime)
+        if (this.lastSampleTime >= 0 && t === this.lastSampleTime) {
+          this.stallCount++
+          // 连续 2 次相同 = 30 秒无进展 → 卡死，自愈
+          if (this.stallCount >= 2) {
+            log('[MONITOR] 进度 ' + t + 's 连续 30 秒未前进，判定卡死，自愈')
+            this.selfHeal(t)
+            this.stallCount = 0
+          }
+        } else {
+          this.stallCount = 0
+        }
+        this.lastSampleTime = t
+      }, 15000)
+    },
+
+    // 播放中途卡死自愈：stop → 重载同一文件 → seek 回卡住位置
+    selfHeal(pos) {
+      const inner = this.inner
+      const item = this.playlist[this.currentIndex]
+      if (!inner || !item) return
+      try {
+        inner.stop()
+      } catch (e) {
+        // 忽略
+      }
+      inner.src = 'file://' + item.path
+      inner.playbackRate = this.playbackRate
+      inner.play()
+      let seeked = false
+      const applySeek = () => {
+        if (seeked) return
+        seeked = true
+        const dur = inner.duration
+        if (pos > 1 && dur && !isNaN(dur) && pos < dur - 1) {
+          inner.seek(pos)
+          log('[MONITOR] 已重播并 seek 回 ' + pos + 's')
+        } else {
+          log('[MONITOR] 已重播（从头，pos=' + pos + 's, dur=' + Math.floor(dur || 0) + 's）')
+        }
+      }
+      inner.onCanplay(applySeek)
+      setTimeout(applySeek, 1500)
     },
 
     /* ================= 倍速播放 ================= */
@@ -1016,6 +1089,8 @@ export default {
       this.analyzeSilence(idx)
       // 启动播放器健康检查（防恢复时卡死）
       this.watchPlaybackHealth()
+      // 启动持续进度监测（防播放中途卡死）
+      this.startMonitor()
     },
 
     /* ================= 其他 ================= */
