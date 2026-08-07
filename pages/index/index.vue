@@ -429,6 +429,53 @@ export default {
       }
     },
 
+    /**
+     * 引导用户"忽略电池优化"（白名单）：防国产 ROM 杀后台进程导致突然无声。
+     * 仅首次启动提示一次；已开启则静默跳过。
+     */
+    checkBatteryOptimization() {
+      // #ifdef APP-PLUS
+      try {
+        // 只提示一次（用户选择过就不再打扰）
+        if (uni.getStorageSync('sonic_battery_prompted')) return
+        uni.setStorageSync('sonic_battery_prompted', true)
+
+        const main = plus.android.runtimeMainActivity()
+        const PowerManager = plus.android.importClass('android.os.PowerManager')
+        const pm = main.getSystemService('power')
+        const pkg = main.getPackageName()
+        // API 23+ 才有 isIgnoringBatteryOptimizations，低版本直接跳过
+        const ignoring = pm.isIgnoringBatteryOptimizations(pkg)
+        if (ignoring) return
+
+        log('[BATTERY] 未忽略电池优化，引导用户设置')
+        uni.showModal({
+          title: '建议开启后台保护',
+          content: '为了息屏时也能连续播放不中断，建议允许 SonicRead 在后台不受限制地运行（关闭省电限制）。是否前往设置？',
+          confirmText: '去设置',
+          cancelText: '暂不',
+          success: (res) => {
+            if (!res.confirm) return
+            try {
+              const Intent = plus.android.importClass('android.content.Intent')
+              const Settings = plus.android.importClass('android.provider.Settings')
+              const Uri = plus.android.importClass('android.net.Uri')
+              const intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+              intent.setData(Uri.parse('package:' + pkg))
+              main.startActivity(intent)
+              log('[BATTERY] 已跳转忽略电池优化设置页')
+            } catch (e) {
+              // 部分系统无该设置页，跳应用详情页让用户手动操作
+              this.goPermissionSettings()
+            }
+          }
+        })
+      } catch (e) {
+        // 低版本系统不支持，静默跳过
+      }
+      // #endif
+    },
+
     /* ================= 扫描（java.io 方式） ================= */
     /**
      * 说明：targetSdkVersion ≥ 29 后，plus.io 无法通过绝对路径访问外部存储
@@ -490,6 +537,8 @@ export default {
         this.fetchDurations(0)
         // 恢复上次播放位置
         this.restorePlayback()
+        // 首次启动引导用户设置"忽略电池优化"（防后台进程被杀）
+        this.checkBatteryOptimization()
       } catch (e) {
         log('[SCAN] 扫描异常 ' + (e && e.message))
         console.error('[SonicRead] 扫描目录失败', e)
