@@ -73,6 +73,7 @@
       </view>
       <view class="rate-row">
         <view class="rate-btn" @click="ratePickerVisible = true">{{ rateLabel }}</view>
+        <view class="rate-btn boost-btn" @click="boostPickerVisible = true">🔊 {{ boostLabel }}</view>
       </view>
     </view>
 
@@ -88,6 +89,23 @@
             :class="{ 'rate-item-active': playbackRate === r }"
             @click="setRate(r)"
           >{{ r }}x</view>
+        </view>
+      </view>
+    </view>
+
+    <!-- ========== 音量增强面板 ========== -->
+    <view class="rate-mask" v-if="boostPickerVisible" @click="boostPickerVisible = false">
+      <view class="rate-panel" @click.stop>
+        <text class="rate-title">音量增强</text>
+        <text class="rate-tip">手机音量开到最大仍偏小时，可放大播放增益</text>
+        <view class="rate-grid">
+          <view
+            v-for="b in boostOptions"
+            :key="b"
+            class="rate-item"
+            :class="{ 'rate-item-active': volumeBoost === b }"
+            @click="setVolumeBoost(b)"
+          >{{ b }}x</view>
         </view>
       </view>
     </view>
@@ -164,6 +182,7 @@ const STORAGE_KEY_STATE = 'sonic_play_state' // 播放记忆：{index, time}（�
 const STORAGE_KEY_INDEX = 'sonic_play_index' // 旧版存储兼容：文件索引
 const STORAGE_KEY_TIME = 'sonic_play_time' // 旧版存储兼容：进度（秒）
 const STORAGE_KEY_RATE = 'sonic_playback_rate' // 播放记忆：倍速
+const STORAGE_KEY_BOOST = 'sonic_volume_boost' // 播放记忆：音量增强倍数
 const SWITCH_DEBOUNCE = 500 // 切歌防抖（ms）
 const AUTO_JUMP_COOLDOWN = 1500 // 自动跳转冷却（防 onEnded 与兜底重复切歌）
 
@@ -187,6 +206,10 @@ export default {
       playbackRate: 1, // 当前倍速（持久化保存）
       ratePickerVisible: false, // 倍速选择面板是否显示
       rateOptions: [0.5, 0.75, 1, 1.25, 1.5, 2], // 可选倍速档位
+      // 音量增强
+      volumeBoost: 1, // 音量增益倍数（>1 放大音量，持久化保存）
+      boostPickerVisible: false, // 音量增强面板是否显示
+      boostOptions: [1, 1.5, 2, 2.5, 3], // 可选增益档位
       // 目录选择面板状态
       dirPickerVisible: false, // 面板是否显示
       pickerPath: '', // 浏览中的路径
@@ -224,6 +247,10 @@ export default {
     // 倍速按钮显示文案，如 "1.0x"
     rateLabel() {
       return this.playbackRate + 'x'
+    },
+    // 音量增强按钮显示文案，如 "1.0x"
+    boostLabel() {
+      return this.volumeBoost + 'x'
     }
   },
 
@@ -284,11 +311,16 @@ export default {
       // 读取持久化的倍速设置（用户上次设置的播放速度）
       const savedRate = parseFloat(uni.getStorageSync(STORAGE_KEY_RATE))
       this.playbackRate = !isNaN(savedRate) && savedRate > 0 ? savedRate : 1
+      // 读取持久化的音量增强设置
+      const savedBoost = parseFloat(uni.getStorageSync(STORAGE_KEY_BOOST))
+      this.volumeBoost = !isNaN(savedBoost) && savedBoost > 0 ? savedBoost : 1
 
       const inner = uni.createInnerAudioContext()
       // 注意：obeyMuteSwitch 在 App-Android 端为只读属性，赋值会抛 "only a getter" 错误，故不设置（该属性仅 iOS 有意义）
       // 恢复倍速设置
       inner.playbackRate = this.playbackRate
+      // 恢复音量增强（>1 为增益放大，Android MediaPlayer 上界不限制）
+      inner.volume = this.volumeBoost
 
       // 播放进度监听（500ms 级，拖动中跳过避免抖动）
       inner.onTimeUpdate(() => {
@@ -735,6 +767,8 @@ export default {
       this.inner.src = 'file://' + this.playlist[idx].path
       // 切歌后保持用户设置的倍速（个别机型需每次设置才生效）
       this.inner.playbackRate = this.playbackRate
+      // 切歌后保持音量增强
+      this.inner.volume = this.volumeBoost
       this.inner.play()
       // 立即保存播放状态（进度归零，防进程被杀后恢复错档）
       this.savePlayState(0)
@@ -998,6 +1032,20 @@ export default {
       uni.setStorageSync(STORAGE_KEY_RATE, r)
       log('[RATE] 倍速设为 ' + r + 'x')
       this.showToast('倍速 ' + r + 'x')
+    },
+
+    /* ================= 音量增强 ================= */
+
+    // 设置音量增益倍数并持久化保存（>1 为放大，Android 播放器上界不限）
+    setVolumeBoost(b) {
+      this.volumeBoost = b
+      this.boostPickerVisible = false
+      if (this.inner) {
+        this.inner.volume = b
+      }
+      uni.setStorageSync(STORAGE_KEY_BOOST, b)
+      log('[BOOST] 音量增强设为 ' + b + 'x')
+      this.showToast('音量增强 ' + b + 'x' + (b > 2 ? '（可能轻微破音）' : ''))
     },
 
     /* ================= 日志查看 ================= */
@@ -1507,6 +1555,18 @@ export default mediaSession
   background-color: #eef4ff;
   padding: 8rpx 32rpx;
   border-radius: 28rpx;
+}
+.boost-btn {
+  color: #b05fd9;
+  background-color: #f5ecfb;
+  margin-left: 16rpx;
+}
+.rate-tip {
+  display: block;
+  text-align: center;
+  font-size: 24rpx;
+  color: #999999;
+  margin: -12rpx 0 20rpx;
 }
 .rate-mask {
   position: fixed;
