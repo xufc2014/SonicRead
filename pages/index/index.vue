@@ -143,9 +143,11 @@
       </view>
     </view>
 
-    <!-- ========== renderjs 承载节点（静音分析） ========== -->
+    <!-- ========== renderjs 承载节点（静音分析 + 媒体会话） ========== -->
     <!-- 通过 :analyze prop 把 { index, base64 } 传给 renderjs 层 -->
     <view ref="silenceView" :analyze="analyzePayload" class="renderjs-host"></view>
+    <!-- 通过 :media-info prop 把播放状态推给 renderjs，注册系统媒体会话 -->
+    <view ref="mediaView" :media-info="mediaSessionInfo" class="renderjs-host"></view>
   </view>
 </template>
 
@@ -209,6 +211,9 @@ export default {
       monitorTimer: null, // 持续进度监测定时器（播放中途卡死检测）
       lastSampleTime: -1, // 上次采样进度（秒）
       stallCount: 0, // 连续未前进次数
+      // 系统媒体会话（MediaSession）
+      mediaSessionInfo: null, // 推给 renderjs 的媒体状态
+      lastMediaSync: 0, // 媒体状态同步节流时间戳
       // 日志面板状态
       logVisible: false, // 日志面板是否显示
       logContent: '' // 日志内容
@@ -330,6 +335,8 @@ export default {
           this.lastSaveTime = nowTs
           this.savePlayState(Math.floor(inner.currentTime))
         }
+        // 节流同步媒体会话进度（每 5 秒）
+        this.updateMediaSession(false)
       })
 
       // 播放完成 → 自动切下一集（自动行为，不参与点击防抖）
@@ -365,16 +372,19 @@ export default {
         this.isPlaying = true
         this.acquireWakeLock()
         log('[PLAYING] 开始播放 idx=' + this.currentIndex)
+        this.updateMediaSession(true)
       })
       inner.onPause(() => {
         this.isPlaying = false
         this.releaseWakeLock()
         log('[PAUSE] 暂停 idx=' + this.currentIndex)
+        this.updateMediaSession(true)
       })
       inner.onStop(() => {
         this.isPlaying = false
         this.releaseWakeLock()
         log('[STOP] 停止 idx=' + this.currentIndex)
+        this.updateMediaSession(true)
       })
 
       this.inner = inner
@@ -729,12 +739,52 @@ export default {
       // 立即保存播放状态（进度归零，防进程被杀后恢复错档）
       this.savePlayState(0)
       log('[PLAY] 播放第' + (idx + 1) + '集 ' + this.playlist[idx].fullName)
+      // 同步媒体会话（标题/状态即时更新）
+      this.updateMediaSession(true)
       // 预分析静音位置（不阻塞播放）
       this.analyzeSilence(idx)
       // 启动播放器健康检查（防切歌卡死）
       this.watchPlaybackHealth()
       // 启动持续进度监测（防播放中途卡死）
       this.startMonitor()
+    },
+
+    /**
+     * 同步媒体状态到系统媒体会话（MediaSession）
+     * @param {boolean} force true=立即同步（状态/标题变化时）；false=5 秒节流（进度更新）
+     */
+    updateMediaSession(force) {
+      const now = Date.now()
+      if (!force && now - this.lastMediaSync < 5000) return
+      this.lastMediaSync = now
+      const item = this.playlist[this.currentIndex]
+      this.mediaSessionInfo = {
+        title: item ? '第' + (this.currentIndex + 1) + '集 ' + item.name : 'SonicRead',
+        playing: this.isPlaying,
+        position: Math.floor(this.inner ? this.inner.currentTime : 0),
+        duration: Math.floor(this.duration || 0)
+      }
+    },
+
+    /**
+     * 系统媒体中心的控制回调（由 renderjs MediaSession 桥接）
+     * @param {Object} e { action: 'play'|'pause'|'prev'|'next'|'seek', seekTime? }
+     */
+    onMediaSessionAction(e) {
+      const action = e && e.action
+      log('[MEDIA] 系统媒体控制: ' + action + (typeof e.seekTime === 'number' ? ' ' + e.seekTime + 's' : ''))
+      if (action === 'play') {
+        this.inner.play()
+      } else if (action === 'pause') {
+        this.inner.pause()
+      } else if (action === 'prev') {
+        this.prev()
+      } else if (action === 'next') {
+        this.next()
+      } else if (action === 'seek' && typeof e.seekTime === 'number') {
+        this.inner.seek(e.seekTime)
+        this.currentTime = e.seekTime
+      }
     },
 
     /**
@@ -1091,6 +1141,8 @@ export default {
       this.watchPlaybackHealth()
       // 启动持续进度监测（防播放中途卡死）
       this.startMonitor()
+      // 同步媒体会话
+      this.updateMediaSession(true)
     },
 
     /* ================= 其他 ================= */
@@ -1121,6 +1173,16 @@ export default {
     }
   }
 }
+</script>
+
+<script module="silenceAnalyzer" lang="renderjs">
+import analyzer from './silence-analyzer.js'
+export default analyzer
+</script>
+
+<script module="mediaSession" lang="renderjs">
+import mediaSession from '../../utils/media-session.js'
+export default mediaSession
 </script>
 
 <style scoped>
@@ -1583,8 +1645,3 @@ export default {
   display: none;
 }
 </style>
-
-<script module="silenceAnalyzer" lang="renderjs">
-import analyzer from './silence-analyzer.js'
-export default analyzer
-</script>
